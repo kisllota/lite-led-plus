@@ -34,3 +34,4 @@ jobs:
         with:
           name: lite-led-custom
           path: package/
+          include-hidden-files: true

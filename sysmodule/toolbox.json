@@ -1,6 +1,6 @@
 {
-    "name": "lite-led",
+    "name": "Lite-LED+",
     "tid": "0100000000000895",
     "requires_reboot": true,
-    "version" : "1.0.0"
+    "version": "1.1.0"
 }

@@ -5,7 +5,7 @@
 
 class GuiCyber : public tsl::Gui {
 public:
-    std::string modeString = "unknown";
+    std::string modeString = "custom";
     GuiCyber() { }
 
     void loadMode() {
@@ -14,101 +14,93 @@ public:
         if (tf.good())
             std::getline(tf, modeString);
         else
-            modeString = "NULL_PTR";
+            modeString = "custom";
     }
 
-    std::string getProtocolAlias(const std::string& raw) {
-        if (raw == "custom")  return "SMART_DAEMON.HEX [SYNCED]";
-        if (raw == "solid")   return "OVERRIDE_HIGH.RAW [100%]";
-        if (raw == "dim")     return "OVERRIDE_LOW.RAW  [33%]";
-        if (raw == "fade")    return "OSCILLATOR.WAV    [PULSE]";
-        if (raw == "off")     return "KILLSWITCH.EXE    [DARK]";
-        return raw;
+    void applyMode(const std::string& newMode) {
+        fsdevMountSdmc();
+        std::ofstream("sdmc:/config/lite-led/reset");
+        std::ofstream("sdmc:/config/lite-led/type") << newMode;
+        loadMode();
+        tsl::changeTo<GuiCyber>();
     }
 
     virtual tsl::elm::Element* createUI() override {
         loadMode();
-        auto frame = new tsl::elm::OverlayFrame("LITE-LED+", "REV.2077 // DAEMON");
+        auto frame = new tsl::elm::OverlayFrame("LITE-LED+", "v1.1.0 // CYBERDECK");
         auto list = new tsl::elm::List();
 
-        // 0x01 SMART DAEMON
-        auto customItem = new tsl::elm::ListItem("0x01 // SMART_DAEMON (AUTO)");
-        customItem->setClickListener([this](u64 keys) {
+        // 1. АВТОМАТИЧЕСКИЙ ПРОФИЛЬ
+        list->addItem(new tsl::elm::CategoryHeader("SYSTEM PROFILE", true));
+
+        std::string smartBadge = (modeString == "custom" || modeString.empty()) ? "[ACTIVE]" : "AUTO";
+        auto smartItem = new tsl::elm::ListItem("Smart Daemon", smartBadge);
+        smartItem->setClickListener([this](u64 keys) {
             if (keys & HidNpadButton_A) {
-                fsdevMountSdmc();
-                std::ofstream("sdmc:/config/lite-led/reset");
-                std::ofstream("sdmc:/config/lite-led/type") << "custom";
-                loadMode();
+                applyMode("custom");
                 return true;
             }
             return false;
         });
-        list->addItem(customItem);
+        list->addItem(smartItem);
 
-        // 0x02 SOLID HIGH
-        auto solidItem = new tsl::elm::ListItem("0x02 // OVERRIDE_HIGH [100%]");
+        // 2. РУЧНОЕ УПРАВЛЕНИЕ
+        list->addItem(new tsl::elm::CategoryHeader("MANUAL OVERRIDE", true));
+
+        std::string solidBadge = (modeString == "solid") ? "[ACTIVE]" : "100%";
+        auto solidItem = new tsl::elm::ListItem("Solid High", solidBadge);
         solidItem->setClickListener([this](u64 keys) {
             if (keys & HidNpadButton_A) {
-                fsdevMountSdmc();
-                std::ofstream("sdmc:/config/lite-led/reset");
-                std::ofstream("sdmc:/config/lite-led/type") << "solid";
-                loadMode();
+                applyMode("solid");
                 return true;
             }
             return false;
         });
         list->addItem(solidItem);
 
-        // 0x03 DIM LOW
-        auto dimItem = new tsl::elm::ListItem("0x03 // OVERRIDE_LOW  [33%]");
+        std::string dimBadge = (modeString == "dim") ? "[ACTIVE]" : "33%";
+        auto dimItem = new tsl::elm::ListItem("Solid Low", dimBadge);
         dimItem->setClickListener([this](u64 keys) {
             if (keys & HidNpadButton_A) {
-                fsdevMountSdmc();
-                std::ofstream("sdmc:/config/lite-led/reset");
-                std::ofstream("sdmc:/config/lite-led/type") << "dim";
-                loadMode();
+                applyMode("dim");
                 return true;
             }
             return false;
         });
         list->addItem(dimItem);
-        
-        // 0x04 FADE OSCILLATE
-        auto fadeItem = new tsl::elm::ListItem("0x04 // OSCILLATE_BREATHE");
+
+        std::string fadeBadge = (modeString == "fade") ? "[ACTIVE]" : "PULSE";
+        auto fadeItem = new tsl::elm::ListItem("Breathing", fadeBadge);
         fadeItem->setClickListener([this](u64 keys) {
             if (keys & HidNpadButton_A) {
-                fsdevMountSdmc();
-                std::ofstream("sdmc:/config/lite-led/reset");
-                std::ofstream("sdmc:/config/lite-led/type") << "fade";
-                loadMode();
+                applyMode("fade");
                 return true;
             }
             return false;
         });
         list->addItem(fadeItem);
 
-        // 0x00 KILLSWITCH
-        auto offItem = new tsl::elm::ListItem("0x00 // KILLSWITCH_OFF");
+        std::string offBadge = (modeString == "off") ? "[ACTIVE]" : "OFF";
+        auto offItem = new tsl::elm::ListItem("LED Output", offBadge);
         offItem->setClickListener([this](u64 keys) {
             if (keys & HidNpadButton_A) {
-                fsdevMountSdmc();
-                std::ofstream("sdmc:/config/lite-led/reset");
-                std::ofstream("sdmc:/config/lite-led/type") << "off";
-                loadMode();
+                applyMode("off");
                 return true;
             }
             return false;
         });
         list->addItem(offItem);
 
-        // Cyberpunk terminal status telemetry
-        auto modeDrawer = new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *renderer, s32 x, s32 y, s32 w, s32 h) {
-            std::string line1 = "// ICE_STATUS: BYPASSED | HW_GPIO: 0x35000065";
-            std::string line2 = ">> ACTIVE: " + getProtocolAlias(modeString);
-            renderer->drawString(line1.c_str(), false, x + 3, y + 16, 15, renderer->a(0x7FFF));
-            renderer->drawString(line2.c_str(), false, x + 3, y + 42, 17, renderer->a(0xFFFF));
+        // 3. ТЕЛЕМЕТРИЯ (БЕЗОПАСНАЯ ШИРИНА)
+        list->addItem(new tsl::elm::CategoryHeader("TELEMETRY", true));
+
+        auto telemetryDrawer = new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *renderer, s32 x, s32 y, s32 w, s32 h) {
+            std::string line1 = "SYS: ONLINE // HW_GPIO: 0x65";
+            std::string line2 = "DAEMON: " + (modeString == "custom" ? "SMART_MODE.HEX" : modeString);
+            renderer->drawString(line1.c_str(), false, x + 8, y + 14, 15, renderer->a(0x8FFF));
+            renderer->drawString(line2.c_str(), false, x + 8, y + 36, 17, renderer->a(0xFFFF));
         });
-        list->addItem(modeDrawer, 70);
+        list->addItem(telemetryDrawer, 60);
 
         frame->setContent(list);
         return frame;

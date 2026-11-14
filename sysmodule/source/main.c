@@ -100,31 +100,6 @@ static Result hwLedSetMode(u32 mode) {
     return serviceDispatchIn(&g_ledController.s, 2, mode);
 }
 
-static Result hwLedSetRisingTime(u32 ms) {
-    if (!g_hwLedReady) return -1;
-    return serviceDispatchIn(&g_ledController.s, 5, ms);
-}
-
-static Result hwLedSetFallingTime(u32 ms) {
-    if (!g_hwLedReady) return -1;
-    return serviceDispatchIn(&g_ledController.s, 7, ms);
-}
-
-static Result hwLedSetPeakTime(u32 ms) {
-    if (!g_hwLedReady) return -1;
-    return serviceDispatchIn(&g_ledController.s, 9, ms);
-}
-
-static Result hwLedSetBreathInterval(u32 ms) {
-    if (!g_hwLedReady) return -1;
-    return serviceDispatchIn(&g_ledController.s, 16, ms);
-}
-
-static Result hwLedSetConstantBrightness(u32 brightness) {
-    if (!g_hwLedReady) return -1;
-    return serviceDispatchIn(&g_ledController.s, 18, brightness);
-}
-
 static Result initHwLed(void) {
     if (!isLite) return -1;
     Result rc = smGetService(&g_ledManager.s, "led");
@@ -459,7 +434,7 @@ int main(int argc, char* argv[]) {
     // Инициализируем аппаратный PMC контроллер (для работы в глубоком сне SC7)
     initHwLed();
 
-    // Запускаем высокоточный программный контур (для активного режима)
+    // Запускаем программный контур (для активного режима с включенным экраном)
     startLiteThreadIfNeeded();
     loadPatternFromFile();
 
@@ -489,7 +464,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 3. Детектируем пробуждение по дельте ARM-таймера (если процессор был в глубоком сне SC7)
+        // 3. Детектируем пробуждение по дельте ARM-таймера (если процессор спал в SC7)
         u64 currentTick = armGetSystemTick();
         u64 elapsedNs = armTicksToNs(currentTick - lastTick);
         lastTick = currentTick;
@@ -514,24 +489,17 @@ int main(int argc, char* argv[]) {
             if (chargerType != PsmChargerType_Unconnected) {
                 // Идет зарядка при погашенном экране: запускаем аппаратный PMC контроллер
                 if (g_hwLedReady) {
-                    int desiredMode = (batteryCharge >= 100) ? 1 : 2;
+                    // В аппаратном драйвере nn::led на Switch Lite (Hoag):
+                    // Mode 1: Аппаратная анимация («дыхание» PMC Breathing)
+                    // Mode 2: Постоянный статический свет (PMC Solid)
+                    int desiredMode = (batteryCharge >= 100) ? 2 : 1;
                     if (!g_hwLedActive || g_lastHwMode != desiredMode) {
-                        hwLedStop();
-                        hwLedSetMode(desiredMode);
-                        hwLedSetConstantBrightness(LITE_DIM_BRIGHTNESS);
-
-                        if (desiredMode == 2) {
-                            // Настройка аппаратного синусоидального дыхания PMC
-                            hwLedSetRisingTime(1000);   // 1.0 сек нарастание
-                            hwLedSetFallingTime(1000);  // 1.0 сек затухание
-                            hwLedSetPeakTime(0);        // Без удержания на пике
-                            hwLedSetBreathInterval(100);// Минимальная пауза в цикле
-                        }
-
-                        hwLedStart();
-                        g_hwLedActive = true;
+                        Result rcMode = hwLedSetMode(desiredMode);
+                        Result rcStart = hwLedStart();
+                        g_hwLedActive = (rcStart == 0);
                         g_lastHwMode = desiredMode;
-                        logDebug("Sleep charging engaged: mode=%d (brightness=%d)", desiredMode, LITE_DIM_BRIGHTNESS);
+                        logDebug("Sleep charging: mode=%d rcMode=0x%X rcStart=0x%X batt=%d%%", 
+                                 desiredMode, rcMode, rcStart, batteryCharge);
                     }
                 }
             } else {
@@ -540,6 +508,7 @@ int main(int argc, char* argv[]) {
                     hwLedStop();
                     g_hwLedActive = false;
                     g_lastHwMode = 0;
+                    logDebug("Sleep charging stopped");
                 }
             }
 
@@ -556,7 +525,7 @@ int main(int argc, char* argv[]) {
                 g_lastHwMode = 0;
             }
 
-            // КРИТИЧЕСКИЙ ШАГ: восстанавливаем владение Pinmux шиной GPIO!
+            // КРИТИЧЕСКИЙ ШАГ: принудительно возвращаем владение Pinmux шиной GPIO!
             initLiteBackend();
 
             if (wakeStep == 0) {

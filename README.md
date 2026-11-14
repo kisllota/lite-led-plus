@@ -15,8 +15,8 @@
 
 **Autonomous Smart Notification LED Sysmodule & Tesla HUD for Nintendo Switch Lite (Hoag)**
 
-[![Build Status](https://github.com/tsarevrar-byte/lite-led-plus/actions/workflows/build.yml/badge.svg)](https://github.com/tsarevrar-byte/lite-led-plus/actions/workflows/build.yml)
-[![Platform](https://img.shields.io/badge/Target-Nintendo%20Switch%20Lite%20(Hoag)-e60012.svg?logo=nintendo-switch&logoColor=white)](https://github.com/tsarevrar-byte/lite-led-plus)
+[![Build Status](https://github.com/kisllota/lite-led-plus/actions/workflows/build.yml/badge.svg)](https://github.com/kisllota/lite-led-plus/actions/workflows/build.yml)
+[![Platform](https://img.shields.io/badge/Target-Nintendo%20Switch%20Lite%20(Hoag)-e60012.svg?logo=nintendo-switch&logoColor=white)](https://github.com/kisllota/lite-led-plus)
 [![Atmosphere](https://img.shields.io/badge/Atmosph%C3%A8re-1.0%2B-blue.svg)](https://github.com/Atmosphere-NX/Atmosphere)
 [![Tesla Compatible](https://img.shields.io/badge/Tesla%20Overlay-v1.1.0-brightgreen.svg)](https://github.com/WerWolv/Tesla-Menu)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)

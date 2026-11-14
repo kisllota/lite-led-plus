@@ -41,6 +41,21 @@ static SelectedMode selectedMode = SelectedMode_Custom;
 // Light Control / Backlight Service (lbl)
 static bool g_lblReady = false;
 
+// Hardware IPC: nn::led::detail::IManager & IController (PMC hardware driver for SC7 deep sleep)
+typedef struct {
+    Service s;
+} LedManager;
+
+typedef struct {
+    Service s;
+} LedController;
+
+static LedManager g_ledManager;
+static LedController g_ledController;
+static bool g_hwLedReady = false;
+static bool g_hwLedActive = false;
+static int g_lastHwMode = 0;
+
 // Unified GPIO Hardware Backend
 static GpioPadSession liteGpioSession;
 static bool liteGpioServiceReady = false;
@@ -66,6 +81,64 @@ static void logDebug(const char* format, ...) {
         va_end(args);
         fputc('\n', logFile);
         fclose(logFile);
+    }
+}
+
+// Low-level IPC commands for nn::led (hardware PMC execution during deep sleep)
+static Result hwLedStart(void) {
+    if (!g_hwLedReady) return -1;
+    return serviceDispatch(&g_ledController.s, 0);
+}
+
+static Result hwLedStop(void) {
+    if (!g_hwLedReady) return -1;
+    return serviceDispatch(&g_ledController.s, 1);
+}
+
+static Result hwLedSetMode(u32 mode) {
+    if (!g_hwLedReady) return -1;
+    return serviceDispatchIn(&g_ledController.s, 2, mode);
+}
+
+static Result hwLedSetConstantBrightness(u32 brightness) {
+    if (!g_hwLedReady) return -1;
+    return serviceDispatchIn(&g_ledController.s, 18, brightness);
+}
+
+static Result initHwLed(void) {
+    if (!isLite) return -1;
+    Result rc = smGetService(&g_ledManager.s, "led");
+    if (R_FAILED(rc)) {
+        logDebug("smGetService('led') failed: 0x%X", rc);
+        return rc;
+    }
+
+    (void)serviceConvertToDomain(&g_ledManager.s);
+
+    u32 deviceCode = LITE_DEVICE_CODE;
+    rc = serviceDispatchIn(&g_ledManager.s, 0, deviceCode,
+        .out_num_objects = 1,
+        .out_objects = &g_ledController.s,
+    );
+    if (R_FAILED(rc)) {
+        logDebug("OpenController(0x35000065) failed: 0x%X", rc);
+        serviceClose(&g_ledManager.s);
+        return rc;
+    }
+
+    g_hwLedReady = true;
+    logDebug("SUCCESS: nn::led hardware PMC controller hooked for deep sleep!");
+    return 0;
+}
+
+static void exitHwLed(void) {
+    if (g_hwLedReady) {
+        hwLedStop();
+        serviceClose(&g_ledController.s);
+        serviceClose(&g_ledManager.s);
+        g_hwLedReady = false;
+        g_hwLedActive = false;
+        g_lastHwMode = 0;
     }
 }
 
@@ -147,6 +220,8 @@ void __appExit(void) {
         liteThreadStarted = false;
     }
 
+    exitHwLed();
+
     if (liteGpioServiceReady) {
         gpioPadSetValue(&liteGpioSession, GpioValue_Low);
         gpioPadClose(&liteGpioSession);
@@ -172,7 +247,7 @@ void __appExit(void) {
 }
 #endif
 
-// Robust Self-Healing GPIO Session Backend
+// Robust Self-Healing GPIO Session Backend (reclaims hardware Pinmux)
 static Result initLiteBackend(void) {
     if (liteGpioServiceReady) {
         gpioPadClose(&liteGpioSession);
@@ -221,7 +296,7 @@ static Result liteSetGpioLevel(bool on) {
     return rc;
 }
 
-// Flicker-Free First-Order Delta-Sigma Software PWM Engine
+// Flicker-Free First-Order Delta-Sigma Software PWM Engine (Active Screen)
 static void liteThreadMain(void* arg) {
     (void)arg;
     u32 phase = 0;
@@ -361,6 +436,10 @@ int main(int argc, char* argv[]) {
     remove("sdmc:/config/lite-led/daemon.log");
     logDebug("=== Lite-LED+ Daemon Boot: model=%s ===", isLite ? "Switch Lite (Hoag)" : "Other");
 
+    // Инициализируем аппаратный PMC контроллер (для работы в глубоком сне SC7)
+    initHwLed();
+
+    // Запускаем высокоточный программный контур (для активного режима)
     startLiteThreadIfNeeded();
     loadPatternFromFile();
 
@@ -390,7 +469,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 3. Детектируем пробуждение по дельте ARM-таймера (если процессор спал в SC7)
+        // 3. Детектируем пробуждение по дельте ARM-таймера (если процессор был в глубоком сне SC7)
         u64 currentTick = armGetSystemTick();
         u64 elapsedNs = armTicksToNs(currentTick - lastTick);
         lastTick = currentTick;
@@ -404,20 +483,60 @@ int main(int argc, char* argv[]) {
         if (screenIsOff) {
             wasSleeping = true;
 
-            // При погашенном экране диод горит ТОЛЬКО если идет зарядка
+            // Гасим софтверный PWM поток (ядра CPU в SC7 всё равно обесточены)
+            setLiteAnimation(LiteAnimMode_Off, 0);
+
             PsmChargerType chargerType = PsmChargerType_Unconnected;
             psmGetChargerType(&chargerType);
-            if (chargerType == PsmChargerType_Unconnected) {
-                setLiteAnimation(LiteAnimMode_Off, 0);
-                svcSleepThread(100000000ULL);
-                continue;
+            u32 batteryCharge = 0;
+            psmGetBatteryChargePercentage(&batteryCharge);
+
+            if (chargerType != PsmChargerType_Unconnected) {
+                // Идет зарядка при погашенном экране: запускаем аппаратный PMC контроллер
+                if (g_hwLedReady) {
+                    int desiredMode = (batteryCharge >= 100) ? 1 : 2;
+                    if (!g_hwLedActive || g_lastHwMode != desiredMode) {
+                        if (desiredMode == 1) {
+                            hwLedSetMode(1);
+                            hwLedSetConstantBrightness(LITE_DIM_BRIGHTNESS);
+                            hwLedStart();
+                        } else {
+                            hwLedSetMode(2);
+                            hwLedStart();
+                        }
+                        g_hwLedActive = true;
+                        g_lastHwMode = desiredMode;
+                        logDebug("Sleep charging engaged: mode=%d", desiredMode);
+                    }
+                }
+            } else {
+                // Без зарядки во сне диод полностью обесточен
+                if (g_hwLedReady && g_hwLedActive) {
+                    hwLedStop();
+                    g_hwLedActive = false;
+                    g_lastHwMode = 0;
+                }
             }
+
+            svcSleepThread(100000000ULL);
+            continue;
         } else if (wasSleeping) {
+            // ЭКРАН ВКЛЮЧИЛСЯ: выход из сна
             wasSleeping = false;
-            logDebug("Screen/System woke up -> Triggering double pulse greeting");
+            logDebug("Screen/System woke up -> disarming HW LED and rearming GPIO");
+
+            if (g_hwLedReady && g_hwLedActive) {
+                hwLedStop();
+                g_hwLedActive = false;
+                g_lastHwMode = 0;
+            }
+
+            // КРИТИЧЕСКИЙ ШАГ: восстанавливаем владение Pinmux шиной GPIO!
+            initLiteBackend();
+
             if (wakeStep == 0) {
                 wakeStep = 1;
-                wakeStepTicks = 10; // 1.0 сек
+                wakeStepTicks = 10; // 1.0 сек первый импульс
             }
         }
 

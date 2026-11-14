@@ -100,6 +100,26 @@ static Result hwLedSetMode(u32 mode) {
     return serviceDispatchIn(&g_ledController.s, 2, mode);
 }
 
+static Result hwLedSetRisingTime(u32 ms) {
+    if (!g_hwLedReady) return -1;
+    return serviceDispatchIn(&g_ledController.s, 5, ms);
+}
+
+static Result hwLedSetFallingTime(u32 ms) {
+    if (!g_hwLedReady) return -1;
+    return serviceDispatchIn(&g_ledController.s, 7, ms);
+}
+
+static Result hwLedSetPeakTime(u32 ms) {
+    if (!g_hwLedReady) return -1;
+    return serviceDispatchIn(&g_ledController.s, 9, ms);
+}
+
+static Result hwLedSetBreathInterval(u32 ms) {
+    if (!g_hwLedReady) return -1;
+    return serviceDispatchIn(&g_ledController.s, 16, ms);
+}
+
 static Result hwLedSetConstantBrightness(u32 brightness) {
     if (!g_hwLedReady) return -1;
     return serviceDispatchIn(&g_ledController.s, 18, brightness);
@@ -496,17 +516,22 @@ int main(int argc, char* argv[]) {
                 if (g_hwLedReady) {
                     int desiredMode = (batteryCharge >= 100) ? 1 : 2;
                     if (!g_hwLedActive || g_lastHwMode != desiredMode) {
-                        if (desiredMode == 1) {
-                            hwLedSetMode(1);
-                            hwLedSetConstantBrightness(LITE_DIM_BRIGHTNESS);
-                            hwLedStart();
-                        } else {
-                            hwLedSetMode(2);
-                            hwLedStart();
+                        hwLedStop();
+                        hwLedSetMode(desiredMode);
+                        hwLedSetConstantBrightness(LITE_DIM_BRIGHTNESS);
+
+                        if (desiredMode == 2) {
+                            // Настройка аппаратного синусоидального дыхания PMC
+                            hwLedSetRisingTime(1000);   // 1.0 сек нарастание
+                            hwLedSetFallingTime(1000);  // 1.0 сек затухание
+                            hwLedSetPeakTime(0);        // Без удержания на пике
+                            hwLedSetBreathInterval(100);// Минимальная пауза в цикле
                         }
+
+                        hwLedStart();
                         g_hwLedActive = true;
                         g_lastHwMode = desiredMode;
-                        logDebug("Sleep charging engaged: mode=%d", desiredMode);
+                        logDebug("Sleep charging engaged: mode=%d (brightness=%d)", desiredMode, LITE_DIM_BRIGHTNESS);
                     }
                 }
             } else {

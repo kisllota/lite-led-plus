@@ -15,6 +15,7 @@ jobs:
       - name: Compile with devkitpro container
         run: |
           docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace devkitpro/devkita64:latest /bin/bash -c "
+            set -e
             export DEVKITPRO=/opt/devkitpro
             make -C sysmodule clean && make -C sysmodule
             make -C overlay clean && make -C overlay

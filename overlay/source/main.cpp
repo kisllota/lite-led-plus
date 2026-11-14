@@ -18,9 +18,24 @@ public:
 
     virtual tsl::elm::Element* createUI() override {
         loadMode();
-        auto frame = new tsl::elm::OverlayFrame("lite-led", "1.0.0");
+        auto frame = new tsl::elm::OverlayFrame("lite-led", "1.0.0-custom");
         auto list = new tsl::elm::List();
 
+        // ===== CUSTOM SMART PROFILE =====
+        auto customItem = new tsl::elm::ListItem("Smart Mode (Auto)");
+        customItem->setClickListener([this](u64 keys) {
+            if (keys & HidNpadButton_A) {
+                fsdevMountSdmc();
+                std::ofstream("sdmc:/config/lite-led/reset");
+                std::ofstream("sdmc:/config/lite-led/type") << "custom";
+                loadMode();
+                return true;
+            }
+            return false;
+        });
+        list->addItem(customItem);
+
+        // ===== SOLID =====
         auto solidItem = new tsl::elm::ListItem("Set LED to Solid");
         solidItem->setClickListener([this](u64 keys) {
             if (keys & HidNpadButton_A) {
@@ -33,7 +48,6 @@ public:
             return false;
         });
         list->addItem(solidItem);
-
 
         // ===== DIM =====
         auto dimItem = new tsl::elm::ListItem("Set LED to Dim");
@@ -49,6 +63,7 @@ public:
         });
         list->addItem(dimItem);
         
+        // ===== FADE =====
         auto fadeItem = new tsl::elm::ListItem("Set LED to Fade");
         fadeItem->setClickListener([this](u64 keys) {
             if (keys & HidNpadButton_A) {
@@ -62,6 +77,7 @@ public:
         });
         list->addItem(fadeItem);
 
+        // ===== OFF =====
         auto offItem = new tsl::elm::ListItem("Set LED to Off");
         offItem->setClickListener([this](u64 keys) {
             if (keys & HidNpadButton_A) {
@@ -74,32 +90,6 @@ public:
             return false;
         });
         list->addItem(offItem);
-
-        auto chargeItem = new tsl::elm::ListItem("Dim when charging");
-        chargeItem->setClickListener([this](u64 keys) {
-            if (keys & HidNpadButton_A) {
-                fsdevMountSdmc();
-                std::ofstream("sdmc:/config/lite-led/reset");
-                std::ofstream("sdmc:/config/lite-led/type") << "charge";
-                loadMode();
-                return true;
-            }
-            return false;
-        });
-        list->addItem(chargeItem);
-
-        auto batteryItem = new tsl::elm::ListItem("Battery warning");
-        batteryItem->setClickListener([this](u64 keys) {
-            if (keys & HidNpadButton_A) {
-                fsdevMountSdmc();
-                std::ofstream("sdmc:/config/lite-led/reset");
-                std::ofstream("sdmc:/config/lite-led/type") << "battery";
-                loadMode();
-                return true;
-            }
-            return false;
-        });
-        list->addItem(batteryItem);
 
         auto modeDrawer = new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *renderer, s32 x, s32 y, s32 w, s32 h) {
             std::string line = "Current mode: " + modeString;

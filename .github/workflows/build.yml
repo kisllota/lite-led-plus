@@ -1,4 +1,4 @@
-name: Build lite-led Custom
+name: Build lite-led-plus
 
 on:
   push:
@@ -27,11 +27,11 @@ jobs:
           cp products/sysmodule/lite-led.nsp package/atmosphere/contents/0100000000000895/exefs.nsp
           cp sysmodule/toolbox.json package/atmosphere/contents/0100000000000895/toolbox.json
           touch package/atmosphere/contents/0100000000000895/flags/boot2.flag
-          cp products/overlay/lite-led.ovl package/switch/.overlays/
+          cp products/overlay/lite-led.ovl package/switch/.overlays/lite-led-plus.ovl
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lite-led-custom
+          name: lite-led-plus
           path: package/
           include-hidden-files: true

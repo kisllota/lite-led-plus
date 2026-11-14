@@ -58,6 +58,9 @@ static bool g_hwLedReady = false;
 static PscPmModule g_pmModule;
 static bool g_pmModuleReady = false;
 
+// Light Control / Backlight Service (lbl)
+static bool g_lblReady = false;
+
 // Fallback GPIO Session
 static GpioPadSession liteGpioSession;
 static bool liteGpioServiceReady = false;
@@ -115,7 +118,10 @@ static Result initHwLed(void) {
         return rc;
     }
 
-    rc = serviceDispatchIn(&g_ledManager.s, 0, (u32)LITE_DEVICE_CODE,
+    (void)serviceConvertToDomain(&g_ledManager.s);
+
+    u32 deviceCode = LITE_DEVICE_CODE;
+    rc = serviceDispatchIn(&g_ledManager.s, 0, deviceCode,
         .out_num_objects = 1,
         .out_objects = &g_ledController.s,
     );
@@ -219,12 +225,16 @@ void __appInit(void) {
     rc = psmInitialize();
     if (R_FAILED(rc)) diagAbortWithResult(rc);
 
+    rc = lblInitialize();
+    if (R_SUCCEEDED(rc)) {
+        g_lblReady = true;
+    }
+
     if (isLite) {
         gpioInitialize();
     }
 
     fsdevMountSdmc();
-    smExit();
 }
 
 void __appExit(void) {
@@ -251,12 +261,18 @@ void __appExit(void) {
         liteGpioServiceReady = false;
     }
 
+    if (g_lblReady) {
+        lblExit();
+        g_lblReady = false;
+    }
+
     fsdevUnmountAll();
     if (isLite) gpioExit();
     hidsysExit();
     hidExit();
     fsExit();
     psmExit();
+    smExit();
 }
 
 #ifdef __cplusplus
@@ -453,6 +469,7 @@ int main(int argc, char* argv[]) {
     int wakeStep = 0;
     int wakeStepTicks = 0;
     u64 lastTick = armGetSystemTick();
+    bool wasSleeping = false;
 
     while (sysmoduleRunning) {
         // Проверяем сброс от оверлея
@@ -463,62 +480,89 @@ int main(int argc, char* argv[]) {
             loadPatternFromFile();
         }
 
-        // ОБРАБОТКА ЦИКЛА СНА И ПРОБУЖДЕНИЯ ЧЕРЕЗ PSC:M
-        if (g_pmModuleReady) {
+        // Проверяем статус экрана (LBL)
+        bool screenIsOff = false;
+        if (g_lblReady) {
+            LblBacklightSwitchStatus blStatus = LblBacklightSwitchStatus_Enabled;
+            if (R_SUCCEEDED(lblGetBacklightSwitchStatus(&blStatus))) {
+                if (blStatus == LblBacklightSwitchStatus_Disabled || blStatus == LblBacklightSwitchStatus_Disabling) {
+                    screenIsOff = true;
+                }
+            }
+        }
+
+        // ОБРАБОТКА СИГНАЛОВ PSC:M
+        if (g_pmModuleReady && R_SUCCEEDED(eventWait(&g_pmModule.event, 0))) {
             PscPmState pscState;
             u32 pscFlags = 0;
             if (R_SUCCEEDED(pscPmModuleGetRequest(&g_pmModule, &pscState, &pscFlags))) {
-                logHw("PSC Signal received: state=%d", pscState);
-
+                logHw("PSC Signal: state=%d", pscState);
                 if (pscState == PscPmState_ReadySleep || pscState == PscPmState_ReadySleepCritical) {
-                    // КОНСОЛЬ УХОДИТ В ГЛУБОКИЙ СОН (SC7)
-                    PsmChargerType chargerType = PsmChargerType_Unconnected;
-                    psmGetChargerType(&chargerType);
-                    u32 batteryCharge = 0;
-                    psmGetBatteryChargePercentage(&batteryCharge);
-
-                    logHw("Sleep Transition: Charging=%d, Battery=%d%%", (chargerType != PsmChargerType_Unconnected), batteryCharge);
-
-                    if (chargerType != PsmChargerType_Unconnected) {
-                        if (g_hwLedReady) {
-                            if (batteryCharge >= 100) {
-                                // 100% на зарядке во сне: аппаратный постоянный свет PMC
-                                hwLedSetMode(1);
-                                hwLedSetConstantBrightness(LITE_DIM_BRIGHTNESS);
-                                hwLedStart();
-                                logHw("PMC Hardware LED armed: SOLID_DIM");
-                            } else {
-                                // Зарядка во сне: аппаратное дыхание PMC
-                                hwLedSetMode(2);
-                                hwLedStart();
-                                logHw("PMC Hardware LED armed: BREATHE");
-                            }
-                        }
-                    } else {
-                        // Без зарядки: гасим диод
-                        if (g_hwLedReady) hwLedStop();
-                    }
-
-                    // Подтверждаем переход ядру ОС (предотвращаем дедлок)
+                    screenIsOff = true;
                     pscPmModuleAcknowledge(&g_pmModule, pscState);
-                }
-                else if (pscState == PscPmState_ReadyAwaken || pscState == PscPmState_ReadyAwakenCritical) {
-                    // КОНСОЛЬ ПРОСНУЛАСЬ
-                    logHw("Wakeup Transition: restoring active state");
-                    if (g_hwLedReady) hwLedStop();
+                } else if (pscState == PscPmState_ReadyAwaken || pscState == PscPmState_ReadyAwakenCritical) {
+                    screenIsOff = false;
                     pscPmModuleAcknowledge(&g_pmModule, pscState);
                 }
             }
         }
 
-        // Детектируем пробуждение по дельте таймера ARM
+        // Детектируем пробуждение по дельте ARM-таймера (если консоль спала без тиков CPU)
         u64 currentTick = armGetSystemTick();
         u64 elapsedNs = armTicksToNs(currentTick - lastTick);
         lastTick = currentTick;
 
         if (elapsedNs > 1800000000ULL) {
+            logHw("SC7 Sleep Wakeup detected: delta=%llu ms", elapsedNs / 1000000ULL);
+            wasSleeping = true;
             wakeStep = 1;
             wakeStepTicks = 10; // 1.0 сек
+        }
+
+        if (screenIsOff) {
+            // КОНСОЛЬ В РЕЖИМЕ СНА / ЭКРАН ПОГАШЕН
+            wasSleeping = true;
+
+            // Гасим софтверный PWM поток (чтобы не конфликтовал с аппаратным контроллером)
+            setLiteAnimation(LiteAnimMode_Off, 0, 0);
+
+            PsmChargerType chargerType = PsmChargerType_Unconnected;
+            psmGetChargerType(&chargerType);
+            u32 batteryCharge = 0;
+            psmGetBatteryChargePercentage(&batteryCharge);
+
+            if (chargerType != PsmChargerType_Unconnected) {
+                if (g_hwLedReady) {
+                    if (batteryCharge >= 100) {
+                        // 100% на зарядке во сне: аппаратный постоянный тусклый свет PMC
+                        hwLedSetMode(1);
+                        hwLedSetConstantBrightness(LITE_DIM_BRIGHTNESS);
+                        hwLedStart();
+                    } else {
+                        // Зарядка во сне (<100%): аппаратное дыхание PMC
+                        hwLedSetMode(2);
+                        hwLedStart();
+                    }
+                }
+            } else {
+                // Во сне без зарядки: диод выключен
+                if (g_hwLedReady) hwLedStop();
+            }
+
+            // В режиме ожидания экрана спим подольше (200мс) для экономии энергии
+            svcSleepThread(200000000ULL);
+            continue;
+        }
+
+        // ЕСЛИ ТОЛЬКО ЧТО ВЫШЛИ ИЗ СНА
+        if (wasSleeping) {
+            wasSleeping = false;
+            logHw("Screen woke up -> releasing HW LED and resuming software PWM");
+            if (g_hwLedReady) hwLedStop();
+            if (wakeStep == 0) {
+                wakeStep = 1;
+                wakeStepTicks = 10; // 1.0 сек первый импульс
+            }
         }
 
         // Перехват нажатия кнопки Home

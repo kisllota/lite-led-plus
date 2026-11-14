@@ -54,10 +54,6 @@ static LedManager g_ledManager;
 static LedController g_ledController;
 static bool g_hwLedReady = false;
 
-// Power State Coordinator (psc:m)
-static PscPmModule g_pmModule;
-static bool g_pmModuleReady = false;
-
 // Light Control / Backlight Service (lbl)
 static bool g_lblReady = false;
 
@@ -145,35 +141,6 @@ static void exitHwLed(void) {
     }
 }
 
-static Result initPscMonitoring(void) {
-    Result rc = pscmInitialize();
-    if (R_FAILED(rc)) {
-        logHw("pscmInitialize failed: 0x%X", rc);
-        return rc;
-    }
-
-    rc = pscmGetPmModule(&g_pmModule, (PscPmModuleId)120, NULL, 0, true);
-    if (R_FAILED(rc)) {
-        rc = pscmGetPmModule(&g_pmModule, (PscPmModuleId)62, NULL, 0, true);
-    }
-
-    if (R_SUCCEEDED(rc)) {
-        g_pmModuleReady = true;
-        logHw("SUCCESS: psc:m sleep lifecycle listener registered!");
-    } else {
-        logHw("pscmGetPmModule failed: 0x%X", rc);
-    }
-    return rc;
-}
-
-static void exitPscMonitoring(void) {
-    if (g_pmModuleReady) {
-        pscPmModuleClose(&g_pmModule);
-        pscmExit();
-        g_pmModuleReady = false;
-    }
-}
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -253,7 +220,6 @@ void __appExit(void) {
     }
 
     exitHwLed();
-    exitPscMonitoring();
 
     if (liteGpioServiceReady) {
         gpioPadSetValue(&liteGpioSession, GpioValue_Low);
@@ -458,10 +424,7 @@ int main(int argc, char* argv[]) {
     // 1. Инициализируем нативный аппаратный драйвер nn::led
     initHwLed();
 
-    // 2. Инициализируем перехватчик сна psc:m
-    initPscMonitoring();
-
-    // 3. Поднимаем софтверный контур (для активной работы)
+    // 2. Поднимаем софтверный контур (для активной работы)
     startLiteThreadIfNeeded();
     loadPatternFromFile();
 
@@ -480,7 +443,7 @@ int main(int argc, char* argv[]) {
             loadPatternFromFile();
         }
 
-        // Проверяем статус экрана (LBL)
+        // 1. Проверяем статус экрана (LBL)
         bool screenIsOff = false;
         if (g_lblReady) {
             LblBacklightSwitchStatus blStatus = LblBacklightSwitchStatus_Enabled;
@@ -491,36 +454,20 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // ОБРАБОТКА СИГНАЛОВ PSC:M
-        if (g_pmModuleReady && R_SUCCEEDED(eventWait(&g_pmModule.event, 0))) {
-            PscPmState pscState;
-            u32 pscFlags = 0;
-            if (R_SUCCEEDED(pscPmModuleGetRequest(&g_pmModule, &pscState, &pscFlags))) {
-                logHw("PSC Signal: state=%d", pscState);
-                if (pscState == PscPmState_ReadySleep || pscState == PscPmState_ReadySleepCritical) {
-                    screenIsOff = true;
-                    pscPmModuleAcknowledge(&g_pmModule, pscState);
-                } else if (pscState == PscPmState_ReadyAwaken || pscState == PscPmState_ReadyAwakenCritical) {
-                    screenIsOff = false;
-                    pscPmModuleAcknowledge(&g_pmModule, pscState);
-                }
-            }
-        }
-
-        // Детектируем пробуждение по дельте ARM-таймера (если консоль спала без тиков CPU)
+        // 2. Детектируем пробуждение по дельте ARM-таймера (если процессор засыпал)
         u64 currentTick = armGetSystemTick();
         u64 elapsedNs = armTicksToNs(currentTick - lastTick);
         lastTick = currentTick;
 
-        if (elapsedNs > 1800000000ULL) {
+        if (elapsedNs > 1500000000ULL) {
             logHw("SC7 Sleep Wakeup detected: delta=%llu ms", elapsedNs / 1000000ULL);
             wasSleeping = true;
             wakeStep = 1;
             wakeStepTicks = 10; // 1.0 сек
         }
 
+        // 3. Обработка сна (экран погашен)
         if (screenIsOff) {
-            // КОНСОЛЬ В РЕЖИМЕ СНА / ЭКРАН ПОГАШЕН
             wasSleeping = true;
 
             // Гасим софтверный PWM поток (чтобы не конфликтовал с аппаратным контроллером)
@@ -534,27 +481,24 @@ int main(int argc, char* argv[]) {
             if (chargerType != PsmChargerType_Unconnected) {
                 if (g_hwLedReady) {
                     if (batteryCharge >= 100) {
-                        // 100% на зарядке во сне: аппаратный постоянный тусклый свет PMC
                         hwLedSetMode(1);
                         hwLedSetConstantBrightness(LITE_DIM_BRIGHTNESS);
                         hwLedStart();
                     } else {
-                        // Зарядка во сне (<100%): аппаратное дыхание PMC
                         hwLedSetMode(2);
                         hwLedStart();
                     }
                 }
             } else {
-                // Во сне без зарядки: диод выключен
                 if (g_hwLedReady) hwLedStop();
             }
 
-            // В режиме ожидания экрана спим подольше (200мс) для экономии энергии
-            svcSleepThread(200000000ULL);
+            // В режиме ожидания экрана спим 100 мс
+            svcSleepThread(100000000ULL);
             continue;
         }
 
-        // ЕСЛИ ТОЛЬКО ЧТО ВЫШЛИ ИЗ СНА
+        // 4. Выход из сна (экран снова включен)
         if (wasSleeping) {
             wasSleeping = false;
             logHw("Screen woke up -> releasing HW LED and resuming software PWM");

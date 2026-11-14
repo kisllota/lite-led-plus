@@ -10,7 +10,7 @@
 #define INNER_HEAP_SIZE 0x80000
 #define MAX_PADS 8
 
-// Hoag exposes the motherboard notification LED through the gpio bus service.
+// Motherboard GPIO notification LED on Switch Lite (Hoag)
 #define LITE_GPIO_DEVICE_CODE 0x35000065U
 #define LITE_GPIO_ACCESS_MODE 3U
 
@@ -22,6 +22,7 @@
 #define LITE_FULL_BRIGHTNESS 255U
 
 typedef enum {
+    SelectedMode_Custom = 0,
     SelectedMode_Dim,
     SelectedMode_Solid,
     SelectedMode_Fade,
@@ -46,8 +47,11 @@ static bool isLite = false;
 static bool chargeSelected = false;
 static bool currentlyCharging = false;
 static bool batterySelected = false;
-static int batteryStatus = -1; // 0: 100%-16% | 1: 15%-6% | 2: 5%-1%
-static SelectedMode selectedMode = SelectedMode_Dim;
+static int batteryStatus = -1;
+static SelectedMode selectedMode = SelectedMode_Custom;
+
+static Event homeButtonEvent;
+static bool homeEventReady = false;
 
 static Thread liteThread;
 static bool liteThreadStarted = false;
@@ -106,6 +110,13 @@ void __appInit(void) {
         diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_HID));
     }
 
+    // Activate and hook Home Button event
+    if (R_SUCCEEDED(hidsysActivateHomeButton())) {
+        if (R_SUCCEEDED(hidsysAcquireHomeButtonEventHandle(&homeButtonEvent, true))) {
+            homeEventReady = true;
+        }
+    }
+
     rc = fsInitialize();
     if (R_FAILED(rc)) {
         diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_FS));
@@ -129,6 +140,11 @@ void __appInit(void) {
 
 void __appExit(void) {
     sysmoduleRunning = false;
+
+    if (homeEventReady) {
+        eventClose(&homeButtonEvent);
+        homeEventReady = false;
+    }
 
     if (liteThreadStarted) {
         liteThreadRunning = false;
@@ -156,20 +172,6 @@ void __appExit(void) {
 #ifdef __cplusplus
 }
 #endif
-
-static void logDebug(const char* format, ...) {
-    FILE* logFile = fopen("sdmc:/config/lite-led/debug.log", "a");
-    if (logFile) {
-        time_t now = time(NULL);
-        fprintf(logFile, "[%lu] ", (unsigned long)now);
-        va_list args;
-        va_start(args, format);
-        vfprintf(logFile, format, args);
-        va_end(args);
-        fputc('\n', logFile);
-        fclose(logFile);
-    }
-}
 
 static void setSolidPattern(u8 intensity) {
     memset(&Pattern, 0, sizeof(Pattern));
@@ -201,7 +203,10 @@ static void setPattern(const char* buffer) {
     batterySelected = false;
     batteryStatus = -1;
 
-    if (strcmp(buffer, "solid") == 0) {
+    if (strcmp(buffer, "custom") == 0) {
+        selectedMode = SelectedMode_Custom;
+        setOffPattern();
+    } else if (strcmp(buffer, "solid") == 0) {
         selectedMode = SelectedMode_Solid;
         setSolidPattern(0xF);
     } else if (strcmp(buffer, "dim") == 0) {
@@ -222,8 +227,8 @@ static void setPattern(const char* buffer) {
         batterySelected = true;
         setOffPattern();
     } else {
-        selectedMode = SelectedMode_Dim;
-        setSolidPattern(0x5);
+        selectedMode = SelectedMode_Custom;
+        setOffPattern();
     }
 }
 
@@ -269,8 +274,6 @@ static void scanForNewControllers(void) {
     };
 
     for (int i = 0; i < MAX_PADS; i++) {
-        // The Lite home LED is not a hidsys controller LED, so only external pads
-        // should stay on the original notification LED path.
         if (isLite && controllerTypes[i] == HidNpadIdType_Handheld) {
             continue;
         }
@@ -304,27 +307,23 @@ static Result liteSetGpioLevel(bool on) {
     if (!liteBackendReady || !liteGpioServiceReady) {
         return KERNELRESULT(InvalidState);
     }
-
     return gpioPadSetValue(&liteGpioSession, on ? GpioValue_High : GpioValue_Low);
 }
 
 static Result initLiteBackend(void) {
     Result rc = gpioOpenSession2(&liteGpioSession, LITE_GPIO_DEVICE_CODE, LITE_GPIO_ACCESS_MODE);
     if (R_FAILED(rc)) {
-        logDebug("Lite gpio open failed: 0x%X", rc);
         return rc;
     }
 
     rc = gpioPadSetDirection(&liteGpioSession, GpioDirection_Output);
     if (R_FAILED(rc)) {
-        logDebug("Lite gpio direction failed: 0x%X", rc);
         gpioPadClose(&liteGpioSession);
         return rc;
     }
 
     rc = gpioPadSetValue(&liteGpioSession, GpioValue_Low);
     if (R_FAILED(rc)) {
-        logDebug("Lite gpio initial write failed: 0x%X", rc);
         gpioPadClose(&liteGpioSession);
         return rc;
     }
@@ -362,32 +361,23 @@ static void litePwmTick(u8 brightness) {
 }
 
 static u8 computeBreatheBrightness(u8 peakBrightness, u32 phase, u32 periodTicks) {
-    if (periodTicks < 2) {
-        return peakBrightness;
-    }
-
+    if (periodTicks < 2) return peakBrightness;
     u32 halfPeriod = periodTicks / 2;
-    if (halfPeriod == 0) {
-        return peakBrightness;
-    }
+    if (halfPeriod == 0) return peakBrightness;
 
     if (phase < halfPeriod) {
         return (u8)((peakBrightness * phase) / halfPeriod);
     }
-
     return (u8)((peakBrightness * (periodTicks - phase)) / halfPeriod);
 }
 
 static void liteThreadMain(void* arg) {
     (void)arg;
-
     u32 phase = 0;
     u32 lastMode = UINT32_MAX;
     u8 lastBrightness = UINT8_MAX;
     u32 lastPeriodTicks = 0;
 
-    // The gpio service only exposes a binary output, so Lite brightness is
-    // approximated with a software PWM worker.
     while (liteThreadRunning) {
         u32 mode = liteAnimMode;
         u8 brightness = liteBrightness;
@@ -409,16 +399,12 @@ static void liteThreadMain(void* arg) {
                 pwmBrightness = brightness;
                 break;
             case LiteAnimMode_Breathe:
-                if (periodTicks < 2) {
-                    periodTicks = LITE_BREATHE_PERIOD_TICKS;
-                }
+                if (periodTicks < 2) periodTicks = LITE_BREATHE_PERIOD_TICKS;
                 pwmBrightness = computeBreatheBrightness(brightness, phase, periodTicks);
                 phase = (phase + 1) % periodTicks;
                 break;
             case LiteAnimMode_Blink:
-                if (periodTicks < 2) {
-                    periodTicks = LITE_BLINK_PERIOD_TICKS;
-                }
+                if (periodTicks < 2) periodTicks = LITE_BLINK_PERIOD_TICKS;
                 pwmBrightness = (phase < (periodTicks / 2)) ? brightness : 0;
                 phase = (phase + 1) % periodTicks;
                 break;
@@ -441,11 +427,8 @@ static void setLiteAnimation(LiteAnimMode mode, u8 brightness, u32 periodTicks) 
 }
 
 static void refreshLiteState(void) {
-    if (!isLite || !liteThreadStarted) {
-        return;
-    }
+    if (!isLite || !liteThreadStarted) return;
 
-    // Match the existing overlay modes with close Lite equivalents.
     switch (selectedMode) {
         case SelectedMode_Solid:
             setLiteAnimation(LiteAnimMode_Solid, LITE_FULL_BRIGHTNESS, 0);
@@ -476,7 +459,6 @@ static void refreshLiteState(void) {
                 setLiteAnimation(LiteAnimMode_Off, 0, 0);
                 break;
             }
-
             u32 batteryCharge = 100;
             if (R_SUCCEEDED(psmGetBatteryChargePercentage(&batteryCharge))) {
                 if (batteryCharge <= 5) {
@@ -491,40 +473,28 @@ static void refreshLiteState(void) {
             }
             break;
         }
+        case SelectedMode_Custom:
         default:
-            setLiteAnimation(LiteAnimMode_Off, 0, 0);
             break;
     }
 }
 
 static void startLiteThreadIfNeeded(void) {
-    if (!isLite || liteThreadStarted) {
-        return;
-    }
+    if (!isLite || liteThreadStarted) return;
+    if (R_FAILED(initLiteBackend())) return;
 
-    Result rc = initLiteBackend();
-    if (R_FAILED(rc)) {
-        logDebug("Lite backend init failed: 0x%X", rc);
-        return;
-    }
-
-    rc = threadCreate(&liteThread, liteThreadMain, NULL, NULL, LITE_THREAD_STACK_SIZE, 0x26, 3);
-    if (R_FAILED(rc)) {
-        logDebug("Lite thread create failed: 0x%X", rc);
-        return;
-    }
+    Result rc = threadCreate(&liteThread, liteThreadMain, NULL, NULL, LITE_THREAD_STACK_SIZE, 0x26, 3);
+    if (R_FAILED(rc)) return;
 
     liteThreadRunning = true;
     rc = threadStart(&liteThread);
     if (R_FAILED(rc)) {
         liteThreadRunning = false;
         threadClose(&liteThread);
-        logDebug("Lite thread start failed: 0x%X", rc);
         return;
     }
 
     liteThreadStarted = true;
-    logDebug("Lite gpio backend ready");
     refreshLiteState();
 }
 
@@ -533,23 +503,23 @@ static void loadPatternFromFile(void) {
     if (!file) {
         FILE* newFile = fopen("sdmc:/config/lite-led/type", "w");
         if (newFile) {
-            fputs("dim", newFile);
+            fputs("custom", newFile);
             fclose(newFile);
         }
         file = fopen("sdmc:/config/lite-led/type", "r");
     }
 
     if (!file) {
-        setPattern("dim");
+        setPattern("custom");
         return;
     }
 
     char buffer[256];
     if (fgets(buffer, sizeof(buffer), file) != NULL) {
-        buffer[strcspn(buffer, "\n")] = 0;
+        buffer[strcspn(buffer, "\r\n")] = 0;
         setPattern(buffer);
     } else {
-        setPattern("dim");
+        setPattern("custom");
     }
 
     fclose(file);
@@ -560,29 +530,29 @@ int main(int argc, char* argv[]) {
     (void)argv;
 
     DIR* dir = opendir("sdmc:/config/lite-led");
-    if (dir) {
-        closedir(dir);
-    } else {
-        mkdir("sdmc:/config/lite-led", 0777);
-    }
-
-    remove("sdmc:/config/lite-led/debug.log");
-    logDebug("Startup: model=%s", isLite ? "Switch Lite" : "Standard/OLED");
+    if (dir) closedir(dir);
+    else mkdir("sdmc:/config/lite-led", 0777);
 
     loadPatternFromFile();
     scanForNewControllers();
     startLiteThreadIfNeeded();
     refreshLiteState();
 
+    int homeOverrideTicks = 0;
+    int wakeStep = 0;
+    int wakeStepTicks = 0;
+    u64 lastTick = armGetSystemTick();
+
     while (sysmoduleRunning) {
         scanForNewControllers();
 
         static int verifyCounter = 0;
-        if (verifyCounter++ >= 5) {
+        if (verifyCounter++ >= 10) {
             verifyConnectedControllers();
             verifyCounter = 0;
         }
 
+        // Check for overlay reset request
         FILE* resetFile = fopen("sdmc:/config/lite-led/reset", "r");
         if (resetFile) {
             fclose(resetFile);
@@ -592,64 +562,87 @@ int main(int argc, char* argv[]) {
             refreshLiteState();
         }
 
-        if (chargeSelected) {
-            PsmChargerType chargerType;
-            psmGetChargerType(&chargerType);
-            if (!currentlyCharging) {
-                if (chargerType != PsmChargerType_Unconnected) {
-                    currentlyCharging = true;
-                    setSolidPattern(0x5);
-                    changeLed();
-                }
-            } else if (chargerType == PsmChargerType_Unconnected) {
-                currentlyCharging = false;
-                setOffPattern();
-                changeLed();
-            }
+        // Detect wake from sleep (> 1.8 sec elapsed during a 100ms sleep)
+        u64 currentTick = armGetSystemTick();
+        u64 elapsedNs = armTicksToNs(currentTick - lastTick);
+        lastTick = currentTick;
+
+        if (elapsedNs > 1800000000ULL) {
+            wakeStep = 1;
+            wakeStepTicks = 10; // 1.0 second first pulse
         }
 
-        if (batterySelected) {
-            PsmChargerType chargerType;
-            psmGetChargerType(&chargerType);
-            if (chargerType == PsmChargerType_Unconnected) {
-                u32 batteryCharge;
-                if (R_SUCCEEDED(psmGetBatteryChargePercentage(&batteryCharge))) {
-                    int lastStatus = batteryStatus;
-                    if (batteryCharge <= 5) {
-                        batteryStatus = 2;
-                    } else if (batteryCharge <= 15) {
-                        batteryStatus = 1;
-                    } else {
-                        batteryStatus = 0;
-                    }
+        // Detect Home Button press
+        bool homePressed = false;
+        if (homeEventReady && R_SUCCEEDED(eventWait(&homeButtonEvent, 0))) {
+            homePressed = true;
+        }
+        HidHomeButtonState homeState;
+        if (hidGetHomeButtonStates(&homeState, 1) > 0) {
+            if (homeState.buttons != 0) {
+                homePressed = true;
+            }
+        }
+        if (homePressed) {
+            homeOverrideTicks = 10; // 1.0 second hold
+        }
 
-                    if (lastStatus != batteryStatus) {
-                        if (batteryStatus == 0) {
-                            setOffPattern();
-                        } else if (batteryStatus == 1) {
-                            setSolidPattern(0x5);
-                        } else {
-                            memset(&Pattern, 0, sizeof(Pattern));
-                            Pattern.baseMiniCycleDuration = 0x4;
-                            Pattern.totalMiniCycles = 0x4;
-                            Pattern.startIntensity = 0x2;
-                            Pattern.miniCycles[0].ledIntensity = 0xF;
-                            Pattern.miniCycles[0].transitionSteps = 0x2;
-                            Pattern.miniCycles[1].ledIntensity = 0x2;
-                            Pattern.miniCycles[1].transitionSteps = 0x2;
-                        }
-                        changeLed();
+        // Custom state machine execution
+        if (selectedMode == SelectedMode_Custom) {
+            if (homeOverrideTicks > 0) {
+                // Priority 1: Home button pressed
+                homeOverrideTicks--;
+                wakeStep = 0;
+                setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS, 0);
+            } else if (wakeStep > 0) {
+                // Priority 2: Wake sequence (1s ON, 0.4s OFF, 1s ON)
+                wakeStepTicks--;
+                if (wakeStep == 1) {
+                    setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS, 0);
+                    if (wakeStepTicks <= 0) {
+                        wakeStep = 2;
+                        wakeStepTicks = 4; // 0.4s off
+                    }
+                } else if (wakeStep == 2) {
+                    setLiteAnimation(LiteAnimMode_Off, 0, 0);
+                    if (wakeStepTicks <= 0) {
+                        wakeStep = 3;
+                        wakeStepTicks = 10; // 1.0s on
+                    }
+                } else if (wakeStep == 3) {
+                    setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS, 0);
+                    if (wakeStepTicks <= 0) {
+                        wakeStep = 0;
                     }
                 }
             } else {
-                setOffPattern();
-                batteryStatus = -1;
-                changeLed();
+                // Priority 3: Battery & Charging
+                PsmChargerType chargerType = PsmChargerType_Unconnected;
+                psmGetChargerType(&chargerType);
+                if (chargerType != PsmChargerType_Unconnected) {
+                    u32 batteryCharge = 0;
+                    if (R_SUCCEEDED(psmGetBatteryChargePercentage(&batteryCharge))) {
+                        if (batteryCharge >= 100) {
+                            // Fully charged: solid dim
+                            setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS, 0);
+                        } else {
+                            // Charging: gentle breathing pulse
+                            setLiteAnimation(LiteAnimMode_Breathe, LITE_DIM_BRIGHTNESS, LITE_BREATHE_PERIOD_TICKS);
+                        }
+                    } else {
+                        setLiteAnimation(LiteAnimMode_Breathe, LITE_DIM_BRIGHTNESS, LITE_BREATHE_PERIOD_TICKS);
+                    }
+                } else {
+                    // Normal idle / gaming: LED off
+                    setLiteAnimation(LiteAnimMode_Off, 0, 0);
+                }
             }
+        } else {
+            // Legacy / overlay manual mode
+            refreshLiteState();
         }
 
-        refreshLiteState();
-        svcSleepThread(500000000ULL);
+        svcSleepThread(100000000ULL); // 100 ms tick
     }
 
     return 0;

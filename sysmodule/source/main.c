@@ -8,15 +8,14 @@
 #include <time.h>
 
 #define INNER_HEAP_SIZE 0x80000
-#define MAX_PADS 8
 
 #define LITE_DEVICE_CODE 0x35000065U
 #define LITE_GPIO_ACCESS_MODE 3U
 
-#define LITE_PWM_PERIOD_NS 200000ULL
 #define LITE_THREAD_STACK_SIZE 0x4000
-#define LITE_BREATHE_PERIOD_TICKS 10000U
-#define LITE_BLINK_PERIOD_TICKS 5000U
+#define LITE_TICK_NS 2000000ULL          // 2 ms per PWM delta-sigma tick (500 Hz)
+#define LITE_BREATHE_PERIOD_TICKS 1000U  // 2.0 seconds at 2 ms/tick
+#define LITE_BLINK_PERIOD_TICKS 500U    // 1.0 second at 2 ms/tick
 #define LITE_DIM_BRIGHTNESS 85U
 #define LITE_FULL_BRIGHTNESS 255U
 
@@ -26,8 +25,6 @@ typedef enum {
     SelectedMode_Solid,
     SelectedMode_Fade,
     SelectedMode_Off,
-    SelectedMode_Charge,
-    SelectedMode_Battery,
 } SelectedMode;
 
 typedef enum {
@@ -41,23 +38,10 @@ static bool sysmoduleRunning = true;
 static bool isLite = false;
 static SelectedMode selectedMode = SelectedMode_Custom;
 
-// Hardware IPC: nn::led::detail::IManager & IController
-typedef struct {
-    Service s;
-} LedManager;
-
-typedef struct {
-    Service s;
-} LedController;
-
-static LedManager g_ledManager;
-static LedController g_ledController;
-static bool g_hwLedReady = false;
-
 // Light Control / Backlight Service (lbl)
 static bool g_lblReady = false;
 
-// Fallback GPIO Session
+// Unified GPIO Hardware Backend
 static GpioPadSession liteGpioSession;
 static bool liteGpioServiceReady = false;
 static bool liteBackendReady = false;
@@ -66,14 +50,13 @@ static Thread liteThread;
 static bool liteThreadStarted = false;
 static volatile bool liteThreadRunning = false;
 static volatile u32 liteAnimMode = LiteAnimMode_Off;
-static volatile u8 liteBrightness = 0;
-static volatile u32 liteAnimPeriodTicks = LITE_BREATHE_PERIOD_TICKS;
+static volatile u8 liteTargetBrightness = 0;
 
 static Event homeButtonEvent;
 static bool homeEventReady = false;
 
-static void logHw(const char* format, ...) {
-    FILE* logFile = fopen("sdmc:/config/lite-led/hw_debug.log", "a");
+static void logDebug(const char* format, ...) {
+    FILE* logFile = fopen("sdmc:/config/lite-led/daemon.log", "a");
     if (logFile) {
         time_t now = time(NULL);
         fprintf(logFile, "[%lu] ", (unsigned long)now);
@@ -83,61 +66,6 @@ static void logHw(const char* format, ...) {
         va_end(args);
         fputc('\n', logFile);
         fclose(logFile);
-    }
-}
-
-// Low-level IPC commands for nn::led::detail::IController
-static Result hwLedStart(void) {
-    if (!g_hwLedReady) return -1;
-    return serviceDispatch(&g_ledController.s, 0);
-}
-
-static Result hwLedStop(void) {
-    if (!g_hwLedReady) return -1;
-    return serviceDispatch(&g_ledController.s, 1);
-}
-
-static Result hwLedSetMode(u32 mode) {
-    if (!g_hwLedReady) return -1;
-    return serviceDispatchIn(&g_ledController.s, 2, mode);
-}
-
-static Result hwLedSetConstantBrightness(u32 brightness) {
-    if (!g_hwLedReady) return -1;
-    return serviceDispatchIn(&g_ledController.s, 18, brightness);
-}
-
-static Result initHwLed(void) {
-    Result rc = smGetService(&g_ledManager.s, "led");
-    if (R_FAILED(rc)) {
-        logHw("smGetService('led') failed: 0x%X", rc);
-        return rc;
-    }
-
-    (void)serviceConvertToDomain(&g_ledManager.s);
-
-    u32 deviceCode = LITE_DEVICE_CODE;
-    rc = serviceDispatchIn(&g_ledManager.s, 0, deviceCode,
-        .out_num_objects = 1,
-        .out_objects = &g_ledController.s,
-    );
-    if (R_FAILED(rc)) {
-        logHw("OpenController(0x35000065) failed: 0x%X", rc);
-        serviceClose(&g_ledManager.s);
-        return rc;
-    }
-
-    g_hwLedReady = true;
-    logHw("SUCCESS: nn::led hardware controller hooked!");
-    return 0;
-}
-
-static void exitHwLed(void) {
-    if (g_hwLedReady) {
-        hwLedStop();
-        serviceClose(&g_ledController.s);
-        serviceClose(&g_ledManager.s);
-        g_hwLedReady = false;
     }
 }
 
@@ -219,12 +147,11 @@ void __appExit(void) {
         liteThreadStarted = false;
     }
 
-    exitHwLed();
-
     if (liteGpioServiceReady) {
         gpioPadSetValue(&liteGpioSession, GpioValue_Low);
         gpioPadClose(&liteGpioSession);
         liteGpioServiceReady = false;
+        liteBackendReady = false;
     }
 
     if (g_lblReady) {
@@ -245,24 +172,30 @@ void __appExit(void) {
 }
 #endif
 
-// Fallback Software PWM Implementation
-static Result liteSetGpioLevel(bool on) {
-    if (!liteBackendReady || !liteGpioServiceReady) return KERNELRESULT(InvalidState);
-    return gpioPadSetValue(&liteGpioSession, on ? GpioValue_High : GpioValue_Low);
-}
-
+// Robust Self-Healing GPIO Session Backend
 static Result initLiteBackend(void) {
+    if (liteGpioServiceReady) {
+        gpioPadClose(&liteGpioSession);
+        liteGpioServiceReady = false;
+        liteBackendReady = false;
+    }
+
     Result rc = gpioOpenSession2(&liteGpioSession, LITE_DEVICE_CODE, LITE_GPIO_ACCESS_MODE);
-    if (R_FAILED(rc)) return rc;
+    if (R_FAILED(rc)) {
+        logDebug("gpioOpenSession2 failed: 0x%X", rc);
+        return rc;
+    }
 
     rc = gpioPadSetDirection(&liteGpioSession, GpioDirection_Output);
     if (R_FAILED(rc)) {
+        logDebug("gpioPadSetDirection failed: 0x%X", rc);
         gpioPadClose(&liteGpioSession);
         return rc;
     }
 
     rc = gpioPadSetValue(&liteGpioSession, GpioValue_Low);
     if (R_FAILED(rc)) {
+        logDebug("gpioPadSetValue failed: 0x%X", rc);
         gpioPadClose(&liteGpioSession);
         return rc;
     }
@@ -272,97 +205,104 @@ static Result initLiteBackend(void) {
     return 0;
 }
 
-static void litePwmTick(u8 brightness) {
-    if (!liteBackendReady) {
-        svcSleepThread(LITE_PWM_PERIOD_NS);
-        return;
+static Result liteSetGpioLevel(bool on) {
+    if (!liteBackendReady || !liteGpioServiceReady) {
+        Result rc = initLiteBackend();
+        if (R_FAILED(rc)) return rc;
     }
 
-    if (brightness == 0) {
-        liteSetGpioLevel(false);
-        svcSleepThread(LITE_PWM_PERIOD_NS);
-        return;
+    Result rc = gpioPadSetValue(&liteGpioSession, on ? GpioValue_High : GpioValue_Low);
+    if (R_FAILED(rc)) {
+        // Auto-recovery: if session drops during USB power state transition, reconnect
+        logDebug("GPIO write failed (0x%X), attempting session recovery...", rc);
+        initLiteBackend();
+        rc = gpioPadSetValue(&liteGpioSession, on ? GpioValue_High : GpioValue_Low);
     }
-
-    if (brightness >= LITE_FULL_BRIGHTNESS) {
-        liteSetGpioLevel(true);
-        svcSleepThread(LITE_PWM_PERIOD_NS);
-        return;
-    }
-
-    u64 onNs = (LITE_PWM_PERIOD_NS * brightness) / LITE_FULL_BRIGHTNESS;
-    u64 offNs = LITE_PWM_PERIOD_NS - onNs;
-
-    liteSetGpioLevel(true);
-    svcSleepThread(onNs);
-    liteSetGpioLevel(false);
-    svcSleepThread(offNs);
+    return rc;
 }
 
-static u8 computeBreatheBrightness(u8 peakBrightness, u32 phase, u32 periodTicks) {
-    if (periodTicks < 2) return peakBrightness;
-    u32 halfPeriod = periodTicks / 2;
-    if (halfPeriod == 0) return peakBrightness;
-
-    if (phase < halfPeriod) {
-        return (u8)((peakBrightness * phase) / halfPeriod);
-    }
-    return (u8)((peakBrightness * (periodTicks - phase)) / halfPeriod);
-}
-
+// Flicker-Free First-Order Delta-Sigma Software PWM Engine
 static void liteThreadMain(void* arg) {
     (void)arg;
     u32 phase = 0;
-    u32 lastMode = UINT32_MAX;
-    u8 lastBrightness = UINT8_MAX;
-    u32 lastPeriodTicks = 0;
+    u32 accumulator = 0;
+    bool lastGpioLevel = false;
 
     while (liteThreadRunning) {
         u32 mode = liteAnimMode;
-        u8 brightness = liteBrightness;
-        u32 periodTicks = liteAnimPeriodTicks;
-        u8 pwmBrightness = 0;
-
-        if (mode != lastMode || brightness != lastBrightness || periodTicks != lastPeriodTicks) {
-            phase = 0;
-            lastMode = mode;
-            lastBrightness = brightness;
-            lastPeriodTicks = periodTicks;
-        }
+        u8 targetBrightness = liteTargetBrightness;
+        u8 currentBrightness = 0;
 
         switch ((LiteAnimMode)mode) {
             case LiteAnimMode_Off:
-                pwmBrightness = 0;
+                currentBrightness = 0;
+                phase = 0;
                 break;
+
             case LiteAnimMode_Solid:
-                pwmBrightness = brightness;
+                currentBrightness = targetBrightness;
+                phase = 0;
                 break;
-            case LiteAnimMode_Breathe:
-                if (periodTicks < 2) periodTicks = LITE_BREATHE_PERIOD_TICKS;
-                pwmBrightness = computeBreatheBrightness(brightness, phase, periodTicks);
-                phase = (phase + 1) % periodTicks;
+
+            case LiteAnimMode_Breathe: {
+                u32 currentPhase = phase % LITE_BREATHE_PERIOD_TICKS;
+                u32 halfPeriod = LITE_BREATHE_PERIOD_TICKS / 2;
+                if (currentPhase < halfPeriod) {
+                    currentBrightness = (u8)((targetBrightness * currentPhase) / halfPeriod);
+                } else {
+                    currentBrightness = (u8)((targetBrightness * (LITE_BREATHE_PERIOD_TICKS - currentPhase)) / halfPeriod);
+                }
+                phase = (phase + 1) % LITE_BREATHE_PERIOD_TICKS;
                 break;
-            case LiteAnimMode_Blink:
-                if (periodTicks < 2) periodTicks = LITE_BLINK_PERIOD_TICKS;
-                pwmBrightness = (phase < (periodTicks / 2)) ? brightness : 0;
-                phase = (phase + 1) % periodTicks;
+            }
+
+            case LiteAnimMode_Blink: {
+                u32 currentPhase = phase % LITE_BLINK_PERIOD_TICKS;
+                currentBrightness = (currentPhase < (LITE_BLINK_PERIOD_TICKS / 2)) ? targetBrightness : 0;
+                phase = (phase + 1) % LITE_BLINK_PERIOD_TICKS;
                 break;
+            }
+
             default:
-                pwmBrightness = 0;
+                currentBrightness = 0;
+                phase = 0;
                 break;
         }
 
-        litePwmTick(pwmBrightness);
+        // Delta-Sigma Modulation
+        bool nextGpioLevel = false;
+        if (currentBrightness == 0) {
+            nextGpioLevel = false;
+            accumulator = 0;
+        } else if (currentBrightness >= 255) {
+            nextGpioLevel = true;
+            accumulator = 0;
+        } else {
+            accumulator += currentBrightness;
+            if (accumulator >= 255) {
+                accumulator -= 255;
+                nextGpioLevel = true;
+            } else {
+                nextGpioLevel = false;
+            }
+        }
+
+        // Minimal IPC calls: only update hardware pin if logical value actually flipped
+        if (nextGpioLevel != lastGpioLevel) {
+            liteSetGpioLevel(nextGpioLevel);
+            lastGpioLevel = nextGpioLevel;
+        }
+
+        svcSleepThread(LITE_TICK_NS);
     }
 
     liteSetGpioLevel(false);
     threadExit();
 }
 
-static void setLiteAnimation(LiteAnimMode mode, u8 brightness, u32 periodTicks) {
+static void setLiteAnimation(LiteAnimMode mode, u8 brightness) {
     liteAnimMode = (u32)mode;
-    liteBrightness = brightness;
-    liteAnimPeriodTicks = periodTicks;
+    liteTargetBrightness = brightness;
 }
 
 static void startLiteThreadIfNeeded(void) {
@@ -418,13 +358,9 @@ int main(int argc, char* argv[]) {
     if (dir) closedir(dir);
     else mkdir("sdmc:/config/lite-led", 0777);
 
-    remove("sdmc:/config/lite-led/hw_debug.log");
-    logHw("=== Lite-LED+ Hardware Daemon Boot ===");
+    remove("sdmc:/config/lite-led/daemon.log");
+    logDebug("=== Lite-LED+ Daemon Boot: model=%s ===", isLite ? "Switch Lite (Hoag)" : "Other");
 
-    // 1. Инициализируем нативный аппаратный драйвер nn::led
-    initHwLed();
-
-    // 2. Поднимаем софтверный контур (для активной работы)
     startLiteThreadIfNeeded();
     loadPatternFromFile();
 
@@ -435,7 +371,7 @@ int main(int argc, char* argv[]) {
     bool wasSleeping = false;
 
     while (sysmoduleRunning) {
-        // Проверяем сброс от оверлея
+        // 1. Проверяем сброс / смену профиля от Tesla оверлея
         FILE* resetFile = fopen("sdmc:/config/lite-led/reset", "r");
         if (resetFile) {
             fclose(resetFile);
@@ -443,7 +379,7 @@ int main(int argc, char* argv[]) {
             loadPatternFromFile();
         }
 
-        // 1. Проверяем статус экрана (LBL)
+        // 2. Проверяем статус подсветки экрана (LBL)
         bool screenIsOff = false;
         if (g_lblReady) {
             LblBacklightSwitchStatus blStatus = LblBacklightSwitchStatus_Enabled;
@@ -454,62 +390,38 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 2. Детектируем пробуждение по дельте ARM-таймера (если процессор засыпал)
+        // 3. Детектируем пробуждение по дельте ARM-таймера (если процессор спал в SC7)
         u64 currentTick = armGetSystemTick();
         u64 elapsedNs = armTicksToNs(currentTick - lastTick);
         lastTick = currentTick;
 
         if (elapsedNs > 1500000000ULL) {
-            logHw("SC7 Sleep Wakeup detected: delta=%llu ms", elapsedNs / 1000000ULL);
+            logDebug("Deep sleep SC7 wake detected: delta=%llu ms", (unsigned long long)(elapsedNs / 1000000ULL));
             wasSleeping = true;
-            wakeStep = 1;
-            wakeStepTicks = 10; // 1.0 сек
         }
 
-        // 3. Обработка сна (экран погашен)
+        // 4. Логика перехода в сон и выхода из сна
         if (screenIsOff) {
             wasSleeping = true;
 
-            // Гасим софтверный PWM поток (чтобы не конфликтовал с аппаратным контроллером)
-            setLiteAnimation(LiteAnimMode_Off, 0, 0);
-
+            // При погашенном экране диод горит ТОЛЬКО если идет зарядка
             PsmChargerType chargerType = PsmChargerType_Unconnected;
             psmGetChargerType(&chargerType);
-            u32 batteryCharge = 0;
-            psmGetBatteryChargePercentage(&batteryCharge);
-
-            if (chargerType != PsmChargerType_Unconnected) {
-                if (g_hwLedReady) {
-                    if (batteryCharge >= 100) {
-                        hwLedSetMode(1);
-                        hwLedSetConstantBrightness(LITE_DIM_BRIGHTNESS);
-                        hwLedStart();
-                    } else {
-                        hwLedSetMode(2);
-                        hwLedStart();
-                    }
-                }
-            } else {
-                if (g_hwLedReady) hwLedStop();
+            if (chargerType == PsmChargerType_Unconnected) {
+                setLiteAnimation(LiteAnimMode_Off, 0);
+                svcSleepThread(100000000ULL);
+                continue;
             }
-
-            // В режиме ожидания экрана спим 100 мс
-            svcSleepThread(100000000ULL);
-            continue;
-        }
-
-        // 4. Выход из сна (экран снова включен)
-        if (wasSleeping) {
+        } else if (wasSleeping) {
             wasSleeping = false;
-            logHw("Screen woke up -> releasing HW LED and resuming software PWM");
-            if (g_hwLedReady) hwLedStop();
+            logDebug("Screen/System woke up -> Triggering double pulse greeting");
             if (wakeStep == 0) {
                 wakeStep = 1;
-                wakeStepTicks = 10; // 1.0 сек первый импульс
+                wakeStepTicks = 10; // 1.0 сек
             }
         }
 
-        // Перехват нажатия кнопки Home
+        // 5. Перехват нажатия кнопки Home
         bool homePressed = false;
         if (homeEventReady && R_SUCCEEDED(eventWait(&homeButtonEvent, 0))) {
             homePressed = true;
@@ -519,50 +431,56 @@ int main(int argc, char* argv[]) {
             homePressed = true;
         }
         if (homePressed) {
-            homeOverrideTicks = 10;
+            homeOverrideTicks = 10; // 1.0 сек удержание
         }
 
-        // Активный режим работы (экран включен)
+        // 6. Исполнение матрицы приоритетов профиля
         if (selectedMode == SelectedMode_Custom) {
             if (homeOverrideTicks > 0) {
+                // Приоритет 1 (P1): Нажатие кнопки Home — немедленный мягкий отклик
                 homeOverrideTicks--;
-                wakeStep = 0;
-                setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS, 0);
+                wakeStep = 0; // Нажатие сбрасывает анимацию приветствия
+                setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS);
             } else if (wakeStep > 0) {
+                // Приоритет 2 (P2): Двойной приветственный импульс при выходе из сна
                 wakeStepTicks--;
                 if (wakeStep == 1) {
-                    setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS, 0);
-                    if (wakeStepTicks <= 0) { wakeStep = 2; wakeStepTicks = 4; }
+                    setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS);
+                    if (wakeStepTicks <= 0) { wakeStep = 2; wakeStepTicks = 4; } // 0.4 сек пауза
                 } else if (wakeStep == 2) {
-                    setLiteAnimation(LiteAnimMode_Off, 0, 0);
-                    if (wakeStepTicks <= 0) { wakeStep = 3; wakeStepTicks = 10; }
+                    setLiteAnimation(LiteAnimMode_Off, 0);
+                    if (wakeStepTicks <= 0) { wakeStep = 3; wakeStepTicks = 10; } // 1.0 сек импульс 2
                 } else if (wakeStep == 3) {
-                    setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS, 0);
-                    if (wakeStepTicks <= 0) wakeStep = 0;
+                    setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS);
+                    if (wakeStepTicks <= 0) { wakeStep = 0; }
                 }
             } else {
+                // Приоритет 3 (P3): Индикация подключения зарядного устройства
                 PsmChargerType chargerType = PsmChargerType_Unconnected;
                 psmGetChargerType(&chargerType);
                 if (chargerType != PsmChargerType_Unconnected) {
                     u32 batteryCharge = 0;
                     psmGetBatteryChargePercentage(&batteryCharge);
                     if (batteryCharge >= 100) {
-                        setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS, 0);
+                        // 100% заряд батареи: ровный тусклый свет
+                        setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS);
                     } else {
-                        setLiteAnimation(LiteAnimMode_Breathe, LITE_DIM_BRIGHTNESS, LITE_BREATHE_PERIOD_TICKS);
+                        // Идет процесс зарядки: мягкое синусоидальное «дыхание»
+                        setLiteAnimation(LiteAnimMode_Breathe, LITE_DIM_BRIGHTNESS);
                     }
                 } else {
-                    setLiteAnimation(LiteAnimMode_Off, 0, 0);
+                    // Базовое состояние: без зарядки диод полностью выключен
+                    setLiteAnimation(LiteAnimMode_Off, 0);
                 }
             }
         } else if (selectedMode == SelectedMode_Solid) {
-            setLiteAnimation(LiteAnimMode_Solid, LITE_FULL_BRIGHTNESS, 0);
+            setLiteAnimation(LiteAnimMode_Solid, LITE_FULL_BRIGHTNESS);
         } else if (selectedMode == SelectedMode_Dim) {
-            setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS, 0);
+            setLiteAnimation(LiteAnimMode_Solid, LITE_DIM_BRIGHTNESS);
         } else if (selectedMode == SelectedMode_Fade) {
-            setLiteAnimation(LiteAnimMode_Breathe, LITE_FULL_BRIGHTNESS, LITE_BREATHE_PERIOD_TICKS);
+            setLiteAnimation(LiteAnimMode_Breathe, LITE_FULL_BRIGHTNESS);
         } else {
-            setLiteAnimation(LiteAnimMode_Off, 0, 0);
+            setLiteAnimation(LiteAnimMode_Off, 0);
         }
 
         svcSleepThread(100000000ULL); // 100 ms

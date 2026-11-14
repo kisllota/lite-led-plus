@@ -1,52 +1,64 @@
-# lite-led (Custom Smart Edition)
+# LITE-LED+ // [CYBERWARE PROTOCOL REV.2077]
 
-A custom fork of [marcinsz89/lite-led](https://github.com/marcinsz89/lite-led) for the **Nintendo Switch Lite**, introducing an automated **Smart Profile** for notification LED control.
+```text
+======================================================================
+  _     ___ _____ _____       _     _____ ____        _ 
+ | |   |_ _|_   _| ____|     | |   | ____|  _ \   _  | |
+ | |    | |  | | |  _|  _____| |   |  _| | | | | (_) | |
+ | |___ | |  | | | |___|_____| |___| |___| |_| |  _  |_|
+ |_____|___| |_| |_____|     |_____|_____|____/  (_) (_)
+======================================================================
+              [ HARDWARE GPIO INJECTION // SWITCH LITE ]
+```
 
-This project consists of:
-- An Atmosphère sysmodule running at Title ID `0100000000000895`
-- A Tesla / Ultrahand overlay at `switch/.overlays/lite-led.ovl`
-
----
-
-## What makes this fork different?
-
-The original utility offered only static predefined modes. This fork implements an OEM-like **Smart Mode (Auto)** with dynamic event tracking:
-
-| Event | Behavior |
-| --- | --- |
-| **Charging (< 100%)** | Soft and gentle breathing/pulsing effect at dim brightness |
-| **Fully Charged (100%)** | Solid dim light while plugged in |
-| **HOME Button Press** | Lights up for 1.0 second on press during gameplay or in OS |
-| **Wake from Sleep** | Greets with a distinct double 1-second pulse |
-| **Gameplay / Idle** | LED remains completely off to avoid distraction |
-
-Manual modes from the original project (`Solid`, `Dim`, `Fade`, `Off`) are fully preserved and accessible via the overlay.
+> **ICE_STATUS:** BYPASSED  
+> **TARGET_HARDWARE:** NINTENDO SWITCH LITE (HOAG)  
+> **SYSMODULE_TID:** `0100000000000895`  
+> **INTERFACE:** TESLA / ULTRAHAND OVERLAY (`lite-led-plus.ovl`)  
 
 ---
 
-## Installation
+### // 01. OVERVIEW
 
-1. Download the latest `lite-led-custom.zip` from the [Releases](../../releases) tab.
-2. Extract the archive onto your computer.
-3. Copy the `atmosphere` and `switch` folders to the root of your Switch microSD card.
-4. If you had an older version installed, delete `sdmc:/config/lite-led/type` to apply Smart Mode immediately.
-5. Reboot the console.
+`lite-led-plus` — модифицированный системный демон Atmosphère и оверлей для низкоуровневого контроля аппаратного светодиода кнопки HOME на материнских платах **Nintendo Switch Lite (Hoag)** через шину `GPIO 0x35000065U`.
+
+Оригинальный функционал расширен протоколом **0x01 SMART_DAEMON**: адаптивным автоматом состояний, отслеживающим прерывания кнопок, таймеры гибернации и контроллер питания.
 
 ---
 
-## Controls
+### // 02. PROTOCOL MATRIX [DAEMON LOGIC]
 
-Open the overlay inside Tesla or Ultrahand and select **Smart Mode (Auto)**.
+| Системный триггер | Поведение диода | Параметры ШИМ |
+| :--- | :--- | :--- |
+| **BATT_CHARGE (<100%)** | Мягкая синусоидальная пульсация | `PWM_BREATHE` (85/255 @ 2.0s) |
+| **BATT_FULL (100%)** | Статичное тусклое свечение | `PWM_SOLID` (85/255) |
+| **KEY_HOME_INTERCEPT** | Световой отклик на нажатие (1.0 сек) | `OVERRIDE_HOLD` (1000ms) |
+| **SYS_WAKE_UP** | Двойной приветственный импульс | `PULSE_x2` (1.0s ON / 0.4s OFF / 1.0s ON) |
+| **IDLE / NET_GAMING** | Полная маскировка (выключен) | `PWM_KILL` (0/255) |
 
 ---
 
-## Automated Builds
+### // 03. CYBERDECK HUD (OVERLAY MENU)
 
-The repository includes a GitHub Actions workflow (`.github/workflows/build.yml`) that compiles both the sysmodule and overlay using the official `devkitpro/devkita64` container on every push.
+* `0x01 // SMART_DAEMON (AUTO)` — запуск автономного адаптивного режима.
+* `0x02 // OVERRIDE_HIGH [100%]` — принудительная максимальная яркость.
+* `0x03 // OVERRIDE_LOW  [33%]` — принудительная тусклая подсветка.
+* `0x04 // OSCILLATE_BREATHE` — бесконечная циклическая пульсация.
+* `0x00 // KILLSWITCH_OFF` — полное отключение светодиода.
 
 ---
 
-## Credits
+### // 04. DEPLOYMENT (INSTALLATION)
 
-- [marcinsz89](https://github.com/marcinsz89/lite-led) — original `lite-led` implementation and overlay.
-- [souldbminerr](https://github.com/souldbminerr) — Switch Lite GPIO notification discovery.
+1. Загрузите архив скомпилированного билда из раздела **Releases**.
+2. Подключите microSD карту к ПК (или запустите DBI MTP).
+3. Скопируйте папки `atmosphere` и `switch` в корень карты памяти.
+4. В папке `switch/.overlays/` удалите старый файл `lite-led.ovl`, если он там остался.
+5. Перезагрузите консоль.
+
+---
+
+### // 05. CREDITS & RECON
+
+* **marcinsz89** — базовая архитектура `lite-led` и реализация программного ШИМ.
+* **souldbminerr** — реверс-инжиниринг адресации GPIO на плате Hoag.
